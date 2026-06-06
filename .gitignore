@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+*.xcodeproj
+.vscode
+
+# e2e Node worker
+E2E/node_modules/
+E2E/.wrangler/
+
+.DS_Store

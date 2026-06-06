@@ -1,0 +1,19 @@
+{
+  "name": "agents-sdk-swift-e2e-worker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal Cloudflare Agents worker (StateAgent + CallableAgent) used to end-to-end test the Swift client. Run with `wrangler dev`, then `swift run E2ESmoke`.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787 --ip 127.0.0.1",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "agents": "0.13.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260128.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.71.0"
+  }
+}
