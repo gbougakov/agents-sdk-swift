@@ -36,8 +36,10 @@ private enum Demo {
 // MARK: - State sync demo
 
 /// State shape mirroring the reference `playground` `StateAgent`
-/// (`{ counter, items, lastUpdated }`).
-struct CounterState: Codable, Sendable {
+/// (`{ counter, items, lastUpdated }`). `nonisolated` keeps the Codable
+/// conformance usable off the main actor in app targets that default to
+/// MainActor isolation (Xcode 26 templates).
+nonisolated struct CounterState: Codable, Sendable {
     var counter: Int
     var items: [String]
     var lastUpdated: String?
@@ -127,7 +129,7 @@ struct StateView: View {
 // MARK: - Chat demo
 
 /// The chat agent's synced state is unused by this demo; an empty struct suffices.
-struct ChatDemoState: Codable, Sendable {}
+nonisolated struct ChatDemoState: Codable, Sendable {}
 
 /// A streaming chat view backed by `ChatSession` (`@MainActor @Observable`).
 /// `session.messages` and `session.status` are observed directly, so the list
@@ -148,15 +150,30 @@ struct ChatView: View {
             state: ChatDemoState.self
         )
         client.connect()
-        let session = ChatSession(client: client)
 
-        // Resolve a client-side tool the server cannot execute (e.g. the
-        // browser-timezone tool in the ai-chat example).
+        // A client-executed tool: its schema is sent with every chat request, the
+        // server advertises it to the model, and when the model calls it the
+        // session runs `execute` here and reports the output automatically.
+        let timezone = ClientTool(
+            name: "getUserTimezone",
+            description: "Get the user's timezone from their device",
+            parameters: .object(["type": .string("object")])
+        ) { _ in
+            .string(TimeZone.current.identifier)
+        }
+
+        let session = ChatSession(client: client, tools: [timezone])
+
+        // Optional fallback for client tool calls with no registered tool (e.g. a
+        // server-defined tool that needs device-side resolution).
         session.onToolCall = { call in
-            guard call.toolName.contains("timezone") || call.toolName.contains("Timezone") else { return }
-            let tz = TimeZone.current.identifier
             await MainActor.run {
-                session.addToolOutput(toolCallId: call.toolCallId, output: .string(tz))
+                session.addToolOutput(
+                    toolCallId: call.toolCallId,
+                    output: .null,
+                    state: .error,
+                    errorText: "Tool \(call.toolName) is not available on this client"
+                )
             }
         }
 

@@ -135,6 +135,12 @@ public struct ChatOptions: Sendable {
 /// to inbound frames to reconcile server-pushed message lists and the stream-resume
 /// handshake, and exposes `sendMessage` / `stop` / `clearHistory` plus tool result
 /// and approval entry points.
+///
+/// Client-executed tools (the reference `tools` option) are registered via
+/// ``registerTool(_:)`` or the `tools:` init parameter: their schemas are sent in
+/// every chat request body, and when the model calls one the session runs its
+/// `execute` closure and reports the output automatically. Unregistered client tool
+/// calls fall back to ``onToolCall``.
 @MainActor
 @Observable
 public final class ChatSession {
@@ -151,11 +157,14 @@ public final class ChatSession {
     /// The error from the most recent failed turn, if ``status`` is ``ChatStatus/error``.
     public private(set) var error: Error?
 
-    /// Whether any stream is active: a client-initiated turn (``ChatStatus/streaming``)
-    /// or a server-initiated stream (resume / tool continuation). Use for a universal
-    /// streaming indicator. Mirrors the reference `isStreaming` flag.
+    /// Whether any stream is active: a client-initiated turn (``ChatStatus/streaming``),
+    /// a server-initiated stream (resume / tool continuation), or a client tool call
+    /// still executing. The last covers the gap where the server has ended its stream
+    /// at a client tool call but the local `execute` / ``onToolCall`` work is still in
+    /// flight — without it consumers would see a "nothing happening" window. Mirrors
+    /// the reference `isStreaming` / `hasPendingClientToolCalls` derivation.
     public var isStreaming: Bool {
-        status == .streaming || serverStreaming
+        status == .streaming || serverStreaming || !pendingClientToolCallIds.isEmpty
     }
 
     /// Whether the current activity is a server-pushed tool continuation (the server
@@ -166,9 +175,11 @@ public final class ChatSession {
     // MARK: - Callbacks
 
     /// Invoked when the model emits a client-side tool call in the `input-available`
-    /// state (a tool without a server-side `execute`). The handler should resolve it
-    /// via ``addToolOutput(toolCallId:output:state:errorText:)``. Mirrors the
-    /// reference `onToolCall`.
+    /// state (a tool without a server-side `execute`) whose name does not match a
+    /// registered ``ClientTool`` — registered tools are executed automatically and
+    /// never reach this handler. The handler should resolve the call via
+    /// ``addToolOutput(toolCallId:output:state:errorText:)``. Mirrors the reference
+    /// `onToolCall`.
     public var onToolCall: ((ToolCall) async -> Void)?
 
     // MARK: - Dependencies
@@ -194,9 +205,20 @@ public final class ChatSession {
     /// The task driving the active client-initiated turn, cancelled by ``stop()``.
     @ObservationIgnored private var activeTurn: Task<Void, Never>?
 
-    /// Tool-call ids already dispatched to ``onToolCall``, to avoid re-firing as the
-    /// same assistant message re-renders. Mirrors the reference `processedToolCalls`.
+    /// Tool-call ids already dispatched to a registered tool or ``onToolCall``, to
+    /// avoid re-firing as the same assistant message re-renders. Mirrors the
+    /// reference `processedToolCalls`.
     @ObservationIgnored private var processedToolCalls: Set<String> = []
+
+    /// The registered client-executed tools, in registration order (preserved when
+    /// serializing schemas). Looked up by name on dispatch; replaced by name on
+    /// re-registration. Mirrors the reference `tools` option.
+    @ObservationIgnored private var registeredTools: [ClientTool]
+
+    /// Tool-call ids whose client-side work (registered `execute` or ``onToolCall``)
+    /// is still in flight. Observable (not ignored) so ``isStreaming`` re-derives as
+    /// work starts and finishes. Mirrors the reference `pendingOnToolCallIds`.
+    private var pendingClientToolCallIds: Set<String> = []
 
     // MARK: - Init
 
@@ -205,9 +227,16 @@ public final class ChatSession {
     /// - Parameters:
     ///   - client: The agent connection (typically an `AgentClient`).
     ///   - options: Chat configuration. Defaults to ``ChatOptions/init(autoContinueAfterToolResult:resume:cancelOnClientAbort:body:getInitialMessages:)``.
-    public init(client: any AgentConnectionProviding, options: ChatOptions = .init()) {
+    ///   - tools: Client-executed tools to register up front. More can be added later
+    ///     via ``registerTool(_:)``.
+    public init(
+        client: any AgentConnectionProviding,
+        options: ChatOptions = .init(),
+        tools: [ClientTool] = []
+    ) {
         self.client = client
         self.options = options
+        self.registeredTools = tools
         self.transport = ChatTransport(
             connection: client,
             cancelOnClientAbort: options.cancelOnClientAbort
@@ -322,7 +351,13 @@ public final class ChatSession {
         status = .submitted
 
         let outgoing = messages
-        let extraBody = options.body
+        var extraBody = options.body
+        // Registered client tool schemas ride in the request body as the top-level
+        // `clientTools` field, overriding any body-provided value (matching the
+        // reference `prepareBody`, which assigns after spreading the body option).
+        if !registeredTools.isEmpty {
+            extraBody["clientTools"] = ClientTool.schemaJSON(of: registeredTools)
+        }
 
         activeTurn?.cancel()
         activeTurn = Task { @MainActor [weak self] in
@@ -465,6 +500,62 @@ public final class ChatSession {
         isToolContinuation = false
         streamingAssistantId = nil
         processedToolCalls.removeAll()
+        pendingClientToolCallIds.removeAll()
+    }
+
+    // MARK: - Client tool registration
+
+    /// Registers a client-executed tool, replacing any existing tool with the same
+    /// name.
+    ///
+    /// Registered tool schemas are sent as the top-level `clientTools` field of every
+    /// chat request body (and refreshed on every `cf_agent_tool_result`), so the
+    /// server advertises them to the model. When the model calls one, the session
+    /// executes ``ClientTool/execute`` and reports the output automatically —
+    /// auto-continuing the turn. Mirrors the reference `useAgentChat` `tools` option.
+    ///
+    /// Tools registered mid-conversation take effect from the next request.
+    public func registerTool(_ tool: ClientTool) {
+        if let index = registeredTools.firstIndex(where: { $0.name == tool.name }) {
+            registeredTools[index] = tool
+        } else {
+            registeredTools.append(tool)
+        }
+    }
+
+    /// Registers a client-executed tool from its parts. See ``registerTool(_:)``.
+    ///
+    /// - Parameters:
+    ///   - name: Unique tool name (replaces an existing registration of the same name).
+    ///   - description: Human-readable description shown to the model.
+    ///   - parameters: JSON-Schema object describing the tool input.
+    ///   - execute: The tool implementation; its return value is the tool output.
+    public func registerTool(
+        name: String,
+        description: String? = nil,
+        parameters: JSONValue? = nil,
+        execute: @escaping ClientTool.Execute
+    ) {
+        registerTool(
+            ClientTool(
+                name: name,
+                description: description,
+                parameters: parameters,
+                execute: execute
+            )
+        )
+    }
+
+    /// Removes the registered client tool with `name`, if any. Takes effect from the
+    /// next request; calls already dispatched still resolve.
+    public func unregisterTool(name: String) {
+        registeredTools.removeAll { $0.name == name }
+    }
+
+    /// The wire schemas of the registered tools, or `nil` when none are registered
+    /// (so the field is omitted from frames entirely).
+    private var registeredToolSchemas: [ChatClientTool]? {
+        registeredTools.isEmpty ? nil : registeredTools.map(\.wireSchema)
     }
 
     // MARK: - Tool results / approvals
@@ -492,6 +583,10 @@ public final class ChatSession {
         let toolName = toolName(for: toolCallId) ?? ""
         let shouldAutoContinue = state == .error ? false : options.autoContinueAfterToolResult
 
+        // The call is resolved from the client's perspective; stop counting it as
+        // pending client-side work (no-op for ids not tracked).
+        pendingClientToolCallIds.remove(toolCallId)
+
         sendFrame {
             try OutboundChatMessage.toolResult(
                 toolCallId: toolCallId,
@@ -499,7 +594,10 @@ public final class ChatSession {
                 output: output,
                 state: state.wireState,
                 errorText: errorText,
-                autoContinue: shouldAutoContinue
+                autoContinue: shouldAutoContinue,
+                // Refresh the server's persisted client tools on every result (the
+                // client is the source of truth), matching `sendToolOutputToServer`.
+                clientTools: registeredToolSchemas
             )
         }
 
@@ -642,12 +740,16 @@ public final class ChatSession {
         }
     }
 
-    // MARK: - onToolCall dispatch
+    // MARK: - Client tool dispatch
 
-    /// Dispatches `input-available` client tool calls on the latest assistant message
-    /// to ``onToolCall``, once each. Mirrors the reference `onToolCall` effect.
+    /// Dispatches `input-available` client tool calls on the latest assistant message,
+    /// once each: calls matching a registered ``ClientTool`` are executed
+    /// automatically; the rest go to ``onToolCall``. Mirrors the reference automatic
+    /// tool resolution and `onToolCall` effects.
     private func dispatchPendingToolCalls(in assistant: UIMessage) {
-        guard let handler = onToolCall, assistant.role == .assistant else { return }
+        guard assistant.role == .assistant,
+              onToolCall != nil || !registeredTools.isEmpty
+        else { return }
 
         for part in assistant.parts {
             let invocation: ToolInvocation
@@ -667,13 +769,52 @@ public final class ChatSession {
                   !processedToolCalls.contains(invocation.toolCallId)
             else { continue }
 
-            processedToolCalls.insert(invocation.toolCallId)
-            let toolCall = ToolCall(
-                toolCallId: invocation.toolCallId,
-                toolName: toolName,
-                input: invocation.input
-            )
-            Task { await handler(toolCall) }
+            if let tool = registeredTools.first(where: { $0.name == toolName }) {
+                processedToolCalls.insert(invocation.toolCallId)
+                executeRegisteredTool(
+                    tool,
+                    toolCallId: invocation.toolCallId,
+                    input: invocation.input
+                )
+            } else if let handler = onToolCall {
+                processedToolCalls.insert(invocation.toolCallId)
+                let toolCall = ToolCall(
+                    toolCallId: invocation.toolCallId,
+                    toolName: toolName,
+                    input: invocation.input
+                )
+                pendingClientToolCallIds.insert(invocation.toolCallId)
+                Task { @MainActor [weak self] in
+                    await handler(toolCall)
+                    self?.pendingClientToolCallIds.remove(toolCall.toolCallId)
+                }
+            }
+        }
+    }
+
+    /// Runs a registered tool and reports its result.
+    ///
+    /// A thrown error is reported as the tool *output* (`"Error executing tool: …"`)
+    /// rather than an `output-error` state, so the turn still auto-continues and the
+    /// model can react to the failure — matching the reference automatic tool
+    /// resolution. (An `output-error` never auto-continues, which would leave the
+    /// turn hanging with no user action to resume it.)
+    private func executeRegisteredTool(
+        _ tool: ClientTool,
+        toolCallId: String,
+        input: JSONValue?
+    ) {
+        pendingClientToolCallIds.insert(toolCallId)
+        Task { @MainActor [weak self] in
+            let output: JSONValue
+            do {
+                output = try await tool.execute(input)
+            } catch {
+                output = .string("Error executing tool: \(error.localizedDescription)")
+            }
+            guard let self else { return }
+            self.pendingClientToolCallIds.remove(toolCallId)
+            self.addToolOutput(toolCallId: toolCallId, output: output)
         }
     }
 

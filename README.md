@@ -68,7 +68,9 @@ broadcasts the canonical value back.
 import Agents
 
 // Matches the server's StateAgentState { counter, items, lastUpdated }.
-struct CounterState: Codable, Sendable {
+// `nonisolated` keeps the Codable conformance usable off the main actor in
+// app targets that default to MainActor isolation (Xcode 26 templates).
+nonisolated struct CounterState: Codable, Sendable {
     var counter: Int
     var items: [String]
     var lastUpdated: String?
@@ -192,7 +194,7 @@ import Agents
 import AgentsChat
 
 // The chat agent's synced state is often empty; an empty struct is fine.
-struct ChatState: Codable, Sendable {}
+nonisolated struct ChatState: Codable, Sendable {}
 
 @MainActor
 func makeChat() -> ChatSession {
@@ -219,10 +221,34 @@ session.sendMessage("What's the weather in London?")
 // session.isStreaming: true while any stream (turn, resume, or tool continuation) is active.
 ```
 
-### Client-side tools and approvals
+### Client tools
 
-When the model calls a tool the server cannot execute (`input-available`), `onToolCall` fires;
-resolve it with `addToolOutput`. When a tool needs approval, respond with `addToolApprovalResponse`:
+Register tools that live on the device (the `tools` option of the reference `useAgentChat`).
+Their schemas are sent as the `clientTools` field of every chat request body, the server merges
+them into the model's toolset, and when the model calls one the session runs `execute` and
+reports the output automatically — the server then auto-continues the turn:
+
+```swift
+let timezone = ClientTool(
+    name: "getUserTimezone",
+    description: "Get the user's timezone from their device",
+    parameters: .object(["type": .string("object")])   // JSON Schema
+) { input in
+    .string(TimeZone.current.identifier)
+}
+
+let session = ChatSession(client: client, tools: [timezone])
+// or later: session.registerTool(_:) / session.unregisterTool(name:)
+```
+
+A thrown `execute` error is reported to the model as the tool output
+(`"Error executing tool: …"`) so the turn still auto-continues.
+
+### onToolCall fallback and approvals
+
+When the model calls a client-side tool with no registered `ClientTool` (`input-available`),
+`onToolCall` fires; resolve it with `addToolOutput`. When a tool needs approval, respond with
+`addToolApprovalResponse`:
 
 ```swift
 session.onToolCall = { call in
