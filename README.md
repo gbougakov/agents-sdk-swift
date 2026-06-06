@@ -248,7 +248,7 @@ A complete SwiftUI chat + state example lives in [`Examples/ChatExample.swift`](
 
 ## End-to-end verification against a local worker
 
-This repo ships a self-contained test worker in [E2E/`](E2E/) (depends only on the published
+This repo ships a self-contained test worker in [`E2E/`](E2E/) (depends only on the published
 `agents` package — no external monorepo). It exposes a `StateAgent` (state sync + RPC) and a
 `CallableAgent` (pure RPC), and is driven by the [`E2ESmoke`](Sources/E2ESmoke/main.swift) target.
 
